@@ -1,0 +1,265 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+## Packages
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(magrittr)
+library(osmdata)
+library(tidymodels)
+library(cowplot)
+library(data.table)
+library(cluster)
+library(factoextra)
+library(Rtsne)
+```
+
+## Reading Data to Correct Dataframes
+
+```{r}
+mbac.list = list()
+sheets = excel_sheets("C:/RScripts/School/MBAC 2020/PHASE-ONE_NYC-housing-data.xlsx")
+sheets.cm = janitor::make_clean_names(sheets, case = "snake")
+sheets = cbind(sheets, sheets.cm) %>% as_tibble()
+
+for (i in sheets$sheets[2:nrow(sheets)]){
+  shname = as.character(sheets[which(sheets$sheets==i), "sheets.cm"])
+   mbac.temp = read_excel("C:/RScripts/School/MBAC 2020/PHASE-ONE_NYC-housing-data.xlsx", 
+                         sheet = i) %>% 
+    janitor::clean_names(case = "snake") %>%
+    select(-short_name, -long_name) %>% 
+    janitor::remove_empty("cols") %>% 
+    pivot_longer(2:ncol(.), 
+                 values_to = shname) %>% 
+    rename("year" = name)
+ mbac.temp$year = str_extract_all(mbac.temp$year, "\\d{4}") %>% 
+   as.integer()
+  mbac.list[[i]] = mbac.temp
+}
+
+list.sba = list()
+list.cd = list()
+for (i in mbac.list){
+  df.temp = i
+  j = names(df.temp[,3])
+   if (names(df.temp[,1])=="sub_borough_area"){
+     list.sba[[j]] = df.temp
+   }else{
+     list.cd[[j]] = df.temp
+   }
+}
+
+mbac.sb = plyr::join_all(list.sba,
+                         by = c("sub_borough_area", "year"),
+                         type = "full")
+mbac.sb$sub_borough_area = as.factor(mbac.sb$sub_borough_area)
+mbac.cd = plyr::join_all(list.cd,
+                         by = c("community_district", "year"),
+                         type = "full")
+mbac.cd$community_district = as.factor(mbac.cd$community_district)
+
+mbac.cd$code = mbac.cd %$% str_extract(community_district, "(.*?) -") %>% 
+  str_remove_all(" |-")
+
+mbac.cd$code_prefix = str_extract(mbac.cd$code, pattern = "^[A-Za-z]{2}")
+mbac.cd$code_suffix = str_extract(mbac.cd$code, pattern = "\\d{2}")
+mbac.cd = mbac.cd %>% mutate(code2 = case_when(
+  code_prefix== "MN" ~ 1,
+  code_prefix== "BX" ~ 2,
+  code_prefix== "BK" ~ 3,
+  code_prefix== "QN" ~ 4,
+  code_prefix== "SI" ~ 5
+),
+code3 = paste0(code2, code_suffix))
+
+cd17 = mbac.cd %>% filter(year==2017)
+```
+
+## Adding Additional Housing Data
+
+```{r}
+hse = read_csv("./Housing_New_York_Units_by_Building.csv") %>% 
+  janitor::clean_names("snake") %>% 
+  mutate(community_board = str_remove(community_board, "-")) %>% 
+  transform(project_start_date = as.Date(project_start_date, "%m/%d/%Y"))
+
+cd_house = hse %>% 
+  group_by(community_board) %>% 
+  mutate(lowinc = (extremely_low_income_units + very_low_income_units + low_income_units),
+         ownshare = (counted_homeownership_units/total_units)) %>% 
+  summarise(total_lowinc = sum(lowinc),
+            ownshare = mean(ownshare),
+            total_units = sum(total_units),
+            lowshare = total_lowinc/total_units)
+
+# mbac.cd_sub = mbac.cd %>% 
+#   group_by(code) %>% 
+#   mutate
+
+cd_house_data = inner_join(cd_house, mbac.cd %>% filter(year==2017), by = c("community_board" = "code"))
+
+cd_house_data %$% cor(total_lowinc, english_scores, use = "pairwise") #check scores & park access
+cd_house_data %$% cor(ownshare, lowshare, use = "pairwise")
+```
+
+## y
+
+```{r}
+nyc = read_csv("./Brooklyn-1-indicators.csv") %>% 
+  mutate(num = str_extract(cd_short_title, "\\d{1,2}"),
+         num = ifelse(str_detect(num, "\\d{2}"), num, paste0(0,num)),
+         cd_let = str_extract(cd_short_title, "^(.*?) "),
+         cd_lett = case_when(
+           cd_let=="Manhattan " ~ "MN",
+           cd_let=="Bronx " ~ "BX",
+           cd_let=="Brooklyn " ~ "BK",
+           cd_let=="Queens " ~ "QN",
+           cd_let=="Staten " ~ "SI"),
+         code = paste0(cd_lett,num))
+
+nyc_2 = left_join(cd17, nyc, by = "code") %>% 
+  select(!contains("moe"))
+
+nyc_2 = left_join(nyc_2, cd_house, by = c("code" = "community_board"))
+nyc_2$code3 = as.integer(nyc_2$code3)
+```
+
+```{r}
+gg1 = mbac.sb %>% 
+  filter(year>2004) %>% 
+  group_by(year) %>% 
+  summarise(s = sum(population)) %>% 
+  ggplot(aes(x = year, y = s))+
+  geom_point(size = 1.5)+
+  geom_smooth(color = "maroon", size = 2)+
+  scale_y_continuous(labels = scales::comma)+
+  labs(title = "NYC Population by Year",
+       subtitle = "Red Line Represents a Trendline",
+       x = "Year",
+       y = "Population")+
+  theme_cowplot(12)
+  
+fit1 = lm(s~year, data = gg1)
+summary(fit1)
+
+nyc_plot1 = nyc_2 %>% 
+  group_by(cd_let) %>% 
+  summarise(s = sum(cd_tot_resunits*2.67)) %>% 
+  mutate(cd_let2 = ifelse(cd_let=="Staten", "Staten Island", cd_let)) %>% 
+  ggplot(aes(x = s, y = reorder(cd_let, s), fill = s))+
+  geom_col() +
+  scale_x_
+```
+
+```{r}
+medinc = read_csv("Median Incomes.csv") %>% 
+  janitor::clean_names("snake") %>% 
+  select(location, fips) %>% 
+  distinct()
+
+mi2 = read_csv("medinc.csv")
+
+sb_temp = mbac.sb %>% filter(year==2017)
+
+sb_join = inner_join(sb_temp, mi2, by = c("sub_borough_area" = "location"))
+
+nyc_3 = left_join(nyc_2, sb_join, by = c("code3" = "fips"))
+```
+
+```{r}
+nyc_3 = read_csv("nyc3.csv")
+
+nyc_3_scale = apply(nyc_3 %>% select_if(is.numeric), 2, scale) %>% 
+  as_tibble() %>% 
+  cbind(., nyc_3$code) %>% 
+  rename("code" = `nyc_3$code`)
+
+kmeans(nyc_3_scale, centers = 2)
+```
+
+```{r}
+nyc_final = nyc_3 %>% select_if(is.numeric)
+nyc_final[is.na(nyc_final)] = 0
+nyc_final_label = nyc_3 %>% select(home_ownership_rate)
+
+tse = Rtsne(nyc_final, dims = 2, verbose = T, max_iter = 500, perplexity = 10)
+tse_dat = tse[["Y"]]
+tse_df = cbind(nyc_3$code, tse_dat) %>%
+  as_tibble() %>% 
+  rename(
+    "code" = 1,
+    "x" = 2,
+    "y" = 3
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
